@@ -310,5 +310,195 @@ def test_config_does_not_leak_runtime_vars(monkeypatch):
     os.unlink(path)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 5: Issue #535 ($4k) — Add --dry-run flag to deploy command
+# File: src/cli/main.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Add --dry-run flag that validates inputs (manifest exists, config valid)
+# but skips actual backend deployment.
+
+# In cli(), add the flag:
+#     deploy_parser.add_argument("--dry-run", action="store_true",
+#                                help="Validate manifest without deploying")
+
+# Replace the deploy handler:
+#     elif args.command == "deploy":
+#         if not os.path.isfile(args.manifest):
+#             print(f"Error: manifest file not found: {args.manifest}", file=sys.stderr)
+#             sys.exit(1)
+#         if args.dry_run:
+#             print(f"Dry run: manifest '{args.manifest}' is valid")
+#             return
+#         print(f"Deploying agent from manifest: {args.manifest}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 6: Issue #590 ($6k) — Redact secrets from webhook failure logs
+# File: src/common/logging.py (or new src/webhooks/delivery.py)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# The webhook delivery path currently logs raw payloads which may contain
+# secrets (API keys, tokens, signatures). Fix: add a SecretRedactor filter
+# that strips known sensitive fields before logging.
+
+import re
+from typing import Set
+
+SENSITIVE_KEYS: Set[str] = {
+    "api_key", "apikey", "api_secret", "secret", "token",
+    "password", "passwd", "authorization", "auth",
+    "private_key", "signing_key", "access_key",
+    "client_secret", "bearer", "credential",
+    "webhook_secret", "hmac", "signature",
+}
+
+SENSITIVE_PATTERNS = [
+    (re.compile(r'(?:Bearer|Basic)\s+[A-Za-z0-9+/=_-]+', re.IGNORECASE), '[REDACTED_AUTH]'),
+    (re.compile(r'sk-[A-Za-z0-9]{20,}'), '[REDACTED_API_KEY]'),
+    (re.compile(r'ghp_[A-Za-z0-9]{36}'), '[REDACTED_GH_TOKEN]'),
+    (re.compile(r'gho_[A-Za-z0-9]{36}'), '[REDACTED_GH_TOKEN]'),
+]
+
+
+def redact_secrets(data: dict, depth: int = 0) -> dict:
+    """Recursively redact sensitive fields from a dict.
+    
+    Replace values whose keys match SENSITIVE_KEYS with '[REDACTED]'.
+    Also scan string values for known secret patterns.
+    
+    Args:
+        data: The dictionary to sanitize (modified in place).
+        depth: Current recursion depth (max 10 to prevent infinite loops).
+    
+    Returns:
+        The sanitized dictionary (same object).
+    """
+    if depth > 10 or not isinstance(data, dict):
+        return data
+
+    for key, value in list(data.items()):
+        key_lower = key.lower()
+        if any(sk in key_lower for sk in SENSITIVE_KEYS):
+            data[key] = '[REDACTED]'
+        elif isinstance(value, dict):
+            redact_secrets(value, depth + 1)
+        elif isinstance(value, list):
+            data[key] = [
+                redact_secrets(item, depth + 1) if isinstance(item, dict)
+                else _redact_value(item)
+                for item in value
+            ]
+        elif isinstance(value, str):
+            data[key] = _redact_value(value)
+
+    return data
+
+
+def _redact_value(value: str) -> str:
+    """Scan a string value for known secret patterns and redact matches."""
+    if not isinstance(value, str):
+        return value
+    for pattern, replacement in SENSITIVE_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+class SecretRedactingLogger:
+    """Logger wrapper that automatically redacts secrets from log messages."""
+    
+    def __init__(self, base_logger):
+        self._logger = base_logger
+
+    def _sanitize(self, msg, *args, **kwargs):
+        if isinstance(msg, dict):
+            msg = redact_secrets(dict(msg))  # copy before mutating
+        if 'extra' in kwargs and isinstance(kwargs['extra'], dict):
+            kwargs['extra'] = redact_secrets(dict(kwargs['extra']))
+        return msg, args, kwargs
+
+    def info(self, msg, *args, **kwargs):
+        msg, args, kwargs = self._sanitize(msg, *args, **kwargs)
+        self._logger.info(msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        msg, args, kwargs = self._sanitize(msg, *args, **kwargs)
+        self._logger.error(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        msg, args, kwargs = self._sanitize(msg, *args, **kwargs)
+        self._logger.warning(msg, *args, **kwargs)
+
+    def debug(self, msg, *args, **kwargs):
+        msg, args, kwargs = self._sanitize(msg, *args, **kwargs)
+        self._logger.debug(msg, *args, **kwargs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Additional tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_deploy_dry_run(tmp_path):
+    """Test: --dry-run validates manifest without deploying."""
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"name": "test"}')
+    import subprocess
+    result = subprocess.run(
+        ["python", "-m", "src.cli.main", "deploy", "--dry-run", str(manifest)],
+        capture_output=True, text=True
+    )
+    assert result.returncode == 0
+    assert "valid" in result.stdout.lower() or "dry" in result.stdout.lower()
+
+
+def test_redact_secrets():
+    """Test: sensitive keys are redacted from payloads."""
+    payload = {
+        "url": "https://example.com/webhook",
+        "api_key": "sk-1234567890abcdefghij",
+        "headers": {
+            "Authorization": "Bearer ghp_1234567890abcdef1234567890abcdef",
+            "Content-Type": "application/json",
+        },
+        "data": {
+            "user": "test",
+            "token": "secret-token-value",
+            "nested": {
+                "api_secret": "very-secret",
+                "safe_field": "visible",
+            }
+        }
+    }
+
+    result = redact_secrets(dict(payload))
+    
+    assert result["api_key"] == '[REDACTED]'
+    assert result["headers"]["Authorization"] == '[REDACTED_AUTH]'
+    assert result["headers"]["Content-Type"] == 'application/json'
+    assert result["data"]["user"] == 'test'
+    assert result["data"]["token"] == '[REDACTED]'
+    assert result["data"]["nested"]["api_secret"] == '[REDACTED]'
+    assert result["data"]["nested"]["safe_field"] == 'visible'
+    assert result["url"] == "https://example.com/webhook"
+
+
+def test_redact_github_tokens():
+    """Test: GitHub tokens are detected in string values."""
+    result = _redact_value("Token: ghp_1234567890abcdef1234567890abcdef")
+    assert "ghp_" not in result
+    assert "REDACTED" in result
+
+
+def test_redact_no_false_positives():
+    """Test: non-sensitive data passes through unchanged."""
+    payload = {
+        "event": "deployment.completed",
+        "status": "success",
+        "duration_ms": 1234,
+    }
+    result = redact_secrets(dict(payload))
+    assert result == payload
+
+
 if __name__ == "__main__":
     print("Run: pytest test_orchestration.py -v")

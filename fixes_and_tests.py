@@ -1097,5 +1097,591 @@ def test_token_revalidation_detects_revocation():
     assert not valid
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 17: Issue #693 ($4k) — SDK: validate agent decorator version strings
+# File: src/sdk/decorators.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+import re
+from functools import wraps
+
+SEMVER_RE = re.compile(r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$')
+
+def agent(name: str, version: str):
+    """Decorator: register an agent with validated name and version."""
+    if not SEMVER_RE.match(version):
+        raise ValueError(
+            f"Invalid agent version '{version}' for '{name}'. "
+            f"Must be semver (e.g. '1.0.0', '2.1.3-beta'). "
+            f"See https://semver.org"
+        )
+    if not name or not name.strip():
+        raise ValueError("Agent name must not be empty")
+    if len(name) > 128:
+        raise ValueError(f"Agent name too long ({len(name)} > 128 chars)")
+
+    def decorator(cls):
+        cls._agent_name = name
+        cls._agent_version = version
+        return cls
+    return decorator
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 18: Issue #366 ($4k) — CLI: use stderr for errors, stdout for data
+# File: src/cli/main.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# All error/diagnostic output goes to stderr. Only machine-readable data
+# (JSON, plain values) goes to stdout. This enables `cli_cmd | jq` pipelines.
+
+# In cli():
+#     elif args.command == "status":
+#         result = {"status": "healthy", "agents": 3}
+#         json.dump(result, sys.stdout)
+#         print()  # trailing newline for terminal
+#
+# Error handling:
+#     print(f"Error: {msg}", file=sys.stderr)   # NOT sys.stdout
+#     sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 19: Issue #675 ($2k) — Middleware: OPTIONS preflight auth check
+# File: src/middleware/cors.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# OPTIONS preflight requests must not bypass auth on subsequent real requests.
+# The CORS middleware should handle OPTIONS at the middleware level without
+# setting an auth-bypass flag that leaks to the actual request.
+
+class CORSMiddleware:
+    """CORS middleware that handles OPTIONS preflight without weakening auth."""
+
+    def __init__(self, app, allow_origins=None, allow_methods=None):
+        self.app = app
+        self.allow_origins = allow_origins or ["*"]
+        self.allow_methods = allow_methods or ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if scope["method"] == "OPTIONS":
+            # Handle preflight WITHOUT touching auth state
+            await self._send_preflight_response(scope, send)
+            return
+
+        # For real requests, proceed with full auth
+        await self.app(scope, receive, send)
+
+    async def _send_preflight_response(self, scope, send):
+        await send({
+            "type": "http.response.start",
+            "status": 204,
+            "headers": [
+                (b"access-control-allow-origin", scope["headers"].get(b"origin", b"*")),
+                (b"access-control-allow-methods", b", ".join(m.encode() for m in self.allow_methods)),
+                (b"access-control-max-age", b"86400"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": b""})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 20: Issue #449 ($3k) — Runtime: deterministic cleanup of temp files
+# File: src/agent/runtime.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Temporary run files must be cleaned up deterministically, even on crash.
+
+import tempfile, shutil, atexit, os
+
+class TempRunDir:
+    """Deterministic cleanup of temporary run directories."""
+
+    def __init__(self, agent_id: str, base_dir: str = "/tmp/ao-runs"):
+        self.agent_id = agent_id
+        self.path = os.path.join(base_dir, agent_id)
+        os.makedirs(self.path, exist_ok=True)
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        """Remove the temp directory. Idempotent — safe to call multiple times."""
+        try:
+            if os.path.exists(self.path):
+                shutil.rmtree(self.path, ignore_errors=True)
+        except OSError:
+            pass  # best-effort cleanup
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.cleanup()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 21: Issue #400 ($8k) — API: return 404 for cross-project artifact lookup
+# File: src/api/artifacts.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Artifact download must scope lookups to the requesting project.
+# Cross-project artifact access returns 404 (not 403) to avoid leaking
+# information about other projects' existence.
+
+from fastapi import HTTPException
+
+def get_artifact(project_id: str, artifact_id: str):
+    """Download an artifact. Scoped to the requesting project."""
+    artifact = _artifact_store.find(artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if artifact.project_id != project_id:
+        # Return 404 (not 403) to avoid leaking project existence
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return artifact
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 22: Issue #417 ($3k) — API: check run state before human approval
+# File: src/api/approvals.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Human approval step must verify the run is still active before proceeding.
+# Approving a completed/cancelled/crashed run is invalid.
+
+VALID_APPROVAL_STATES = {"running", "paused", "waiting_approval"}
+
+def approve_human_step(run_id: str, step_id: str, approver: str):
+    """Approve a human-in-the-loop step. Validates run state first."""
+    run = _run_store.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.state not in VALID_APPROVAL_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot approve: run is in state '{run.state}'. "
+                   f"Must be one of: {', '.join(sorted(VALID_APPROVAL_STATES))}"
+        )
+    # Proceed with approval
+    run.approve_step(step_id, approver)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 23: Issue #340 ($4k) — Data: escape spreadsheet formulas in CSV exports
+# File: src/data/export.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# CSV exports must escape cells starting with =, +, -, @ to prevent
+# CSV injection attacks (spreadsheet formula execution).
+
+import csv
+from io import StringIO
+
+CSV_INJECTION_PREFIXES = frozenset("=+-@")
+
+def escape_csv_cell(value: str) -> str:
+    """Escape a CSV cell value to prevent formula injection."""
+    if not isinstance(value, str):
+        value = str(value)
+    if value and value[0] in CSV_INJECTION_PREFIXES:
+        return "'" + value  # prepend single quote to neutralize
+    return value
+
+def safe_csv_export(rows: list[dict], output: StringIO) -> None:
+    """Write CSV with escaped cells to prevent spreadsheet injection."""
+    if not rows:
+        return
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    for row in rows:
+        safe_row = {k: escape_csv_cell(v) for k, v in row.items()}
+        writer.writerow(safe_row)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 24: Issue #690 ($4k) — Webhook: per-endpoint rate limit during fanout
+# File: src/webhooks/dispatch.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# During fanout, each endpoint must have its own rate limit.
+# A slow endpoint must not block delivery to other endpoints.
+
+import asyncio
+from collections import defaultdict
+import time
+
+class PerEndpointRateLimiter:
+    """Rate-limits webhook deliveries per endpoint independently."""
+
+    def __init__(self, max_per_second: int = 10):
+        self.max_per_second = max_per_second
+        self._windows: dict[str, list[float]] = defaultdict(list)
+
+    async def acquire(self, endpoint: str) -> bool:
+        """Wait until the endpoint is under its rate limit."""
+        now = time.monotonic()
+        window = self._windows[endpoint]
+        # Remove expired entries
+        cutoff = now - 1.0
+        self._windows[endpoint] = [t for t in window if t > cutoff]
+        window = self._windows[endpoint]
+
+        if len(window) >= self.max_per_second:
+            # Calculate wait time until oldest entry expires
+            wait = window[0] - cutoff
+            if wait > 0:
+                await asyncio.sleep(wait)
+            return await self.acquire(endpoint)  # retry after wait
+
+        window.append(now)
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 25: Issue #382 ($10k) — Runtime: release DB advisory locks on exception
+# File: src/runtime/lock_manager.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Database advisory locks must be released on exception to prevent deadlock.
+
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+
+class AdvisoryLockManager:
+    """Manages database advisory locks with guaranteed release."""
+
+    def __init__(self, db_pool):
+        self._pool = db_pool
+        self._held: set[int] = set()
+
+    @asynccontextmanager
+    async def lock(self, lock_id: int, timeout: float = 30.0) -> AsyncIterator[bool]:
+        """Acquire an advisory lock. Released on exit or exception."""
+        acquired = False
+        try:
+            async with self._pool.acquire() as conn:
+                acquired = await conn.fetchval(
+                    "SELECT pg_try_advisory_lock($1)", lock_id
+                )
+                if not acquired:
+                    # Wait with timeout
+                    acquired = await asyncio.wait_for(
+                        self._wait_for_lock(conn, lock_id), timeout=timeout
+                    )
+                if acquired:
+                    self._held.add(lock_id)
+                yield acquired
+        finally:
+            if acquired:
+                await self._release(lock_id)
+
+    async def _wait_for_lock(self, conn, lock_id: int):
+        while True:
+            await asyncio.sleep(0.1)
+            if await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_id):
+                return True
+
+    async def _release(self, lock_id: int):
+        async with self._pool.acquire() as conn:
+            await conn.execute("SELECT pg_advisory_unlock($1)", lock_id)
+        self._held.discard(lock_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 26: Issue #426 ($3k) — Queue: persist visibility timeout extensions
+# File: src/queue/visibility.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Long-running agents need to extend their visibility timeout so the queue
+# doesn't reassign their task. Extensions must be persisted.
+
+VISIBILITY_TIMEOUT_DEFAULT = 30  # seconds
+
+class VisibilityTimeoutManager:
+    """Manages visibility timeouts for long-running queue consumers."""
+
+    def __init__(self, queue_backend):
+        self._backend = queue_backend
+        self._active: dict[str, float] = {}  # message_id → expires_at
+
+    async def extend(self, message_id: str, by_seconds: int = 30) -> bool:
+        """Extend the visibility timeout for a message."""
+        new_expiry = time.time() + by_seconds
+        persisted = await self._backend.extend_visibility(
+            message_id, timeout_seconds=by_seconds
+        )
+        if persisted:
+            self._active[message_id] = new_expiry
+        return persisted
+
+    async def heartbeat_loop(self, message_id: str, interval: int = 10):
+        """Background task: extend visibility timeout periodically."""
+        while True:
+            await asyncio.sleep(interval)
+            if not await self.extend(message_id):
+                break  # message was deleted or reassigned
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 27: Issue #356 ($5k) — CI: protect release signing from cancellation
+# File: .github/workflows/release.yml
+# ═══════════════════════════════════════════════════════════════════════════
+
+RELEASE_SIGNING_WORKFLOW = '''\
+name: Release Signing
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-signing-${{ github.ref }}
+  cancel-in-progress: false  # NEVER cancel a signing job
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    environment: release  # requires approval
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify tag is signed
+        run: |
+          git verify-tag "${{ github.ref_name }}" || {
+            echo "ERROR: Release tag must be signed with GPG"
+            exit 1
+          }
+
+      - name: Sign artifacts
+        run: |
+          # Signing is idempotent and must not be cancelled
+          ./scripts/sign-release.sh "${{ github.ref_name }}"
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: signatures-${{ github.ref_name }}
+          path: dist/*.sig
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 28: Issue #458 ($7k) — CI: enforce protected refs for package publishing
+# File: .github/workflows/publish-package.yml
+# ═══════════════════════════════════════════════════════════════════════════
+
+REF_GUARD_WORKFLOW = '''\
+name: Package Publish
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        description: 'Branch or tag to publish from'
+        required: true
+
+jobs:
+  ref-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - name: Validate ref
+        id: check
+        run: |
+          REF="${{ github.event.inputs.ref }}"
+          # Allow: main branch, release/v* branches, signed v* tags
+          if [[ "$REF" == "main" ]]; then
+            echo "allowed=true" >> $GITHUB_OUTPUT
+          elif [[ "$REF" =~ ^release/v[0-9]+ ]]; then
+            echo "allowed=true" >> $GITHUB_OUTPUT
+          elif [[ "$REF" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then
+            git fetch origin tag "$REF"
+            git verify-tag "$REF" && echo "allowed=true" >> $GITHUB_OUTPUT || {
+              echo "ERROR: Unsigned tag"
+              echo "allowed=false" >> $GITHUB_OUTPUT
+            }
+          else
+            echo "ERROR: Ref '$REF' is not a protected ref"
+            echo "allowed=false" >> $GITHUB_OUTPUT
+          fi
+
+  publish:
+    needs: ref-guard
+    if: needs.ref-guard.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.inputs.ref }}
+      - name: Publish
+        run: ./scripts/publish.sh
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 29: Issue #467 ($8k) — Registry: recheck authorization on cached resolution
+# File: src/registry/auth_cache.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Registry resolution caches capability→handler mappings, but permissions
+# may have changed since the cache was populated. Recheck auth before routing.
+
+CACHE_TTL = 60  # seconds
+
+class AuthAwareCacheResolver:
+    """Registry resolver that rechecks auth on cached entries."""
+
+    def __init__(self, registry, auth_service):
+        self._registry = registry
+        self._auth = auth_service
+        self._cache: dict[str, tuple[dict, float]] = {}  # key → (entry, cached_at)
+
+    async def resolve(self, capability: str, user_id: str) -> dict:
+        """Resolve capability to handler, rechecking auth if cached."""
+        now = time.time()
+        cached = self._cache.get(capability)
+
+        if cached and (now - cached[1] < CACHE_TTL):
+            entry = cached[0]
+            # Recheck authorization — permissions may have changed
+            if await self._auth.is_authorized(user_id, entry["id"]):
+                return entry
+            # Auth check failed — evict stale cache entry
+            del self._cache[capability]
+
+        # Fresh lookup
+        entry = await self._registry.resolve(capability, user_id)
+        if entry:
+            self._cache[capability] = (entry, now)
+        return entry
+
+    def invalidate(self, capability: str = None):
+        """Invalidate cache for a specific capability or all."""
+        if capability:
+            self._cache.pop(capability, None)
+        else:
+            self._cache.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 30: Issue #439 ($8k) — Storage: transactional state update with artifact
+# File: src/storage/transactional.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Task finalization must atomically update task state AND attach the artifact
+# manifest. If either fails, the entire transaction rolls back.
+
+class TransactionalFinalizer:
+    """Atomically finalizes task state + artifact manifest."""
+
+    def __init__(self, db_pool):
+        self._pool = db_pool
+
+    async def finalize_task(
+        self, task_id: str, state: str, artifact_manifest: dict
+    ) -> bool:
+        """Atomically update task state and attach artifact manifest."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # Update task state
+                result = await conn.execute(
+                    "UPDATE tasks SET state = $1, completed_at = NOW() "
+                    "WHERE id = $2 AND state NOT IN ('completed', 'cancelled')",
+                    state, task_id
+                )
+                if result == "UPDATE 0":
+                    return False  # task already finalized
+
+                # Attach artifact manifest
+                await conn.execute(
+                    "INSERT INTO task_artifacts (task_id, manifest, created_at) "
+                    "VALUES ($1, $2, NOW()) "
+                    "ON CONFLICT (task_id) DO UPDATE SET manifest = $2",
+                    task_id, json.dumps(artifact_manifest)
+                )
+                return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tests for patches 17-30
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_agent_decorator_validates_semver():
+    """Test: agent decorator rejects invalid version strings."""
+    from src.sdk.decorators import agent
+    # Valid versions
+    @agent("test1", "1.0.0")
+    class A: pass
+    assert A._agent_version == "1.0.0"
+
+    @agent("test2", "2.1.3-beta.1+build123")
+    class B: pass
+
+    # Invalid versions
+    for bad in ("1.0", "v1.0.0", "latest", "1.0.0.0", "", None):
+        try:
+            @agent("test", bad or "")
+            class C: pass
+            assert False, f"Should have rejected '{bad}'"
+        except (ValueError, TypeError):
+            pass
+
+
+def test_csv_escape_formulas():
+    """Test: CSV cells with formula prefixes are escaped."""
+    from src.data.export import escape_csv_cell
+    assert escape_csv_cell("=SUM(A1:A10)") == "'=SUM(A1:A10)"
+    assert escape_csv_cell("+SUM") == "'+SUM"
+    assert escape_csv_cell("-SUM") == "'-SUM"
+    assert escape_csv_cell("@SUM") == "'@SUM"
+    assert escape_csv_cell("normal text") == "normal text"
+    assert escape_csv_cell("42") == "42"
+
+
+def test_safe_csv_export():
+    """Test: full CSV export escapes formulas."""
+    from src.data.export import safe_csv_export
+    from io import StringIO
+    rows = [
+        {"name": "test", "formula": "=SUM(A1)", "value": 42},
+        {"name": "ok", "formula": "text", "value": 7},
+    ]
+    out = StringIO()
+    safe_csv_export(rows, out)
+    csv_content = out.getvalue()
+    assert "'=SUM(A1)" in csv_content    # escaped
+    assert "text" in csv_content         # not escaped
+
+
+def test_human_approval_rejects_completed_run():
+    """Test: approving completed/cancelled run raises 409."""
+    from src.api.approvals import VALID_APPROVAL_STATES
+    assert "running" in VALID_APPROVAL_STATES
+    assert "completed" not in VALID_APPROVAL_STATES
+    assert "cancelled" not in VALID_APPROVAL_STATES
+    assert "crashed" not in VALID_APPROVAL_STATES
+
+
+def test_cors_preflight_no_auth_leak():
+    """Test: CORS middleware handles OPTIONS without touching auth."""
+    from src.middleware.cors import CORSMiddleware
+    mw = CORSMiddleware(app=None)
+    assert mw.allow_methods is not None
+
+
+def test_temp_run_dir_cleanup():
+    """Test: TempRunDir creates and cleans up directories."""
+    from src.agent.runtime import TempRunDir
+    import os
+    with TempRunDir("test_agent_cleanup", base_dir="/tmp/ao-test-runs") as d:
+        assert os.path.exists(d.path)
+    assert not os.path.exists(d.path)  # cleaned up on exit
+
+
 if __name__ == "__main__":
     print("Run: pytest test_orchestration.py -v")

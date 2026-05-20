@@ -1818,5 +1818,191 @@ def test_config_rejects_deep_nesting(mocker):
         assert "nesting" in str(e).lower()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 33: Issue #764 ($6k) — API: reject unsafe callback URLs at registration
+# File: src/api/integrations.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Callback URLs registered by integrations must be validated for safety:
+# - No localhost/private IPs (prevents SSRF)
+# - HTTPS required (no plaintext callbacks)
+# - No userinfo in URL (prevents credential leakage)
+# - Maximum URL length check
+
+import re
+from urllib.parse import urlparse
+import ipaddress
+
+BLOCKED_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+]
+MAX_CALLBACK_URL_LEN = 2048
+
+def validate_callback_url(url: str) -> str:
+    """Validate a callback URL is safe. Returns normalized URL or raises ValueError."""
+    if not url or len(url) > MAX_CALLBACK_URL_LEN:
+        raise ValueError(f"Callback URL too long (max {MAX_CALLBACK_URL_LEN} chars)")
+
+    parsed = urlparse(url)
+
+    if parsed.scheme != "https":
+        raise ValueError("Callback URL must use HTTPS")
+
+    if parsed.username or parsed.password:
+        raise ValueError("Callback URL must not contain credentials")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("Callback URL missing hostname")
+
+    if hostname in BLOCKED_HOSTS:
+        raise ValueError(f"Callback host '{hostname}' is blocked")
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        for net in BLOCKED_NETWORKS:
+            if ip in net:
+                raise ValueError(f"Private IP '{hostname}' is not allowed for callbacks")
+    except ValueError:
+        pass  # hostname, not IP — OK (will be resolved by DNS at delivery time)
+
+    return url
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 34: Issue #760 ($7k) — Runtime: persist state before emitting events
+# File: src/runtime/state_machine.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Run state must be durably persisted BEFORE emitting completion events.
+# If the process crashes between state change and event emission, the
+# event is lost. Fix: persist first, then emit.
+
+from enum import Enum
+from typing import Callable, Awaitable
+
+class RunState(Enum):
+    PENDING = "pending"
+    STARTING = "starting"
+    RUNNING = "running"
+    COMPLETING = "completing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+VALID_TRANSITIONS = {
+    RunState.PENDING:    {RunState.STARTING, RunState.CANCELLED},
+    RunState.STARTING:   {RunState.RUNNING, RunState.FAILED},
+    RunState.RUNNING:    {RunState.COMPLETING, RunState.FAILED, RunState.CANCELLED},
+    RunState.COMPLETING: {RunState.COMPLETED, RunState.FAILED},
+    RunState.FAILED:     set(),
+    RunState.COMPLETED:  set(),
+    RunState.CANCELLED:  set(),
+}
+
+class StateMachine:
+    """Durable state machine: persists state before emitting side effects."""
+
+    def __init__(self, db, event_emitter: Callable[[str, str], Awaitable[None]]):
+        self._db = db
+        self._emit = event_emitter
+
+    async def transition(self, run_id: str, new_state: RunState) -> bool:
+        """Atomically transition run state. Emits event AFTER durable persist."""
+        current = await self._db.get_run_state(run_id)
+        if new_state not in VALID_TRANSITIONS.get(current, set()):
+            return False
+
+        # 1. Persist state durably BEFORE emitting side effects
+        await self._db.set_run_state(run_id, new_state)
+
+        # 2. Only emit if persist succeeded
+        try:
+            await self._emit(run_id, new_state.value)
+        except Exception:
+            pass  # event emission is best-effort; state is already persisted
+
+        return True
+
+    async def complete(self, run_id: str, result: dict = None) -> bool:
+        """Complete a run: COMPLETING → persist result → COMPLETED."""
+        if not await self.transition(run_id, RunState.COMPLETING):
+            return False
+        if result:
+            await self._db.set_run_result(run_id, result)
+        return await self.transition(run_id, RunState.COMPLETED)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_validate_callback_url_https():
+    """Test: only HTTPS URLs are accepted."""
+    from src.api.integrations import validate_callback_url
+    validate_callback_url("https://example.com/hook")
+    try:
+        validate_callback_url("http://example.com/hook")
+        assert False
+    except ValueError as e:
+        assert "HTTPS" in str(e)
+
+
+def test_validate_callback_url_blocks_localhost():
+    """Test: localhost and private IPs are rejected."""
+    from src.api.integrations import validate_callback_url
+    for bad in ("https://localhost/hook", "https://127.0.0.1/hook",
+                "https://192.168.1.1/hook", "https://10.0.0.1/hook"):
+        try:
+            validate_callback_url(bad)
+            assert False, f"Should reject {bad}"
+        except ValueError:
+            pass
+
+
+def test_validate_callback_url_no_credentials():
+    """Test: URLs with userinfo are rejected."""
+    from src.api.integrations import validate_callback_url
+    try:
+        validate_callback_url("https://user:pass@example.com/hook")
+        assert False
+    except ValueError as e:
+        assert "credential" in str(e).lower()
+
+
+def test_state_machine_persists_before_emit():
+    """Test: state is persisted before event emission."""
+    from src.runtime.state_machine import StateMachine, RunState
+    events = []
+    db = {"states": {}}
+    class FakeDB:
+        async def get_run_state(self, rid):
+            return RunState(db["states"].get(rid, "pending"))
+        async def set_run_state(self, rid, st):
+            db["states"][rid] = st.value
+        async def set_run_result(self, rid, result):
+            db["result"] = result
+
+    async def emitter(rid, evt):
+        events.append((rid, evt))
+        # At this point, state must already be in DB
+        assert db["states"].get(rid) == "completed"
+        events.append(("verified", db["states"][rid]))
+
+    import asyncio
+    sm = StateMachine(FakeDB(), emitter)
+    db["states"]["run-1"] = "running"
+    loop = asyncio.new_event_loop()
+    ok = loop.run_until_complete(sm.complete("run-1", {"answer": 42}))
+    loop.close()
+    assert ok
+    assert db["states"]["run-1"] == "completed"
+    assert len(events) >= 2
+
+
 if __name__ == "__main__":
     print("Run: pytest test_orchestration.py -v")

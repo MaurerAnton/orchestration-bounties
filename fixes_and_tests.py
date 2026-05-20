@@ -172,5 +172,143 @@ def test_config_get_bool():
     os.unlink(path)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 3: Issue #635 ($4k) — Treat zero exit as STOPPED, not CRASHED
+# File: src/agent/runtime.py, method: AgentRuntime.get_state
+# ═══════════════════════════════════════════════════════════════════════════
+
+# --- BEFORE ---
+#     def get_state(self, agent_id: str) -> RuntimeState:
+#         proc = self._processes.get(agent_id)
+#         if proc and proc.poll() is not None:
+#             self._states[agent_id] = RuntimeState.CRASHED
+#         return self._states.get(agent_id, RuntimeState.STOPPED)
+
+# --- AFTER ---
+#     def get_state(self, agent_id: str) -> RuntimeState:
+#         proc = self._processes.get(agent_id)
+#         if proc and proc.poll() is not None:
+#             # Process has exited — check exit code to distinguish stopped vs crashed
+#             if proc.returncode == 0:
+#                 self._states[agent_id] = RuntimeState.STOPPED
+#             else:
+#                 self._states[agent_id] = RuntimeState.CRASHED
+#         return self._states.get(agent_id, RuntimeState.STOPPED)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 4: Issue #611 ($3k) — Config: scope env overrides to known keys only
+# File: src/common/config.py, method: Config._load_env_overrides
+# ═══════════════════════════════════════════════════════════════════════════
+
+# The current implementation blindly imports every AO_* environment variable
+# into the config tree. This leaks runtime-only values (like AO_AGENT_ID)
+# into config snapshots. Fix: use a scoped prefix AO_CONFIG_ for overrides.
+
+# --- BEFORE ---
+#     def _load_env_overrides(self) -> None:
+#         prefix = "AO_"
+#         for key, value in os.environ.items():
+#             if key.startswith(prefix):
+#                 config_key = key[len(prefix):].lower().replace("_", ".")
+#                 self._set_nested(config_key, value)
+
+# --- AFTER ---
+#     # Known configuration keys that may be overridden via environment.
+#     # Runtime-only keys (AO_AGENT_ID, etc.) are NOT imported into config.
+#     CONFIG_OVERRIDE_PREFIX = "AO_CONFIG_"
+#
+#     def _load_env_overrides(self) -> None:
+#         """Import environment overrides for known configuration keys only.
+#
+#         Only variables prefixed with AO_CONFIG_ are treated as config
+#         overrides. Runtime-only variables (AO_AGENT_ID, etc.) are ignored
+#         to prevent leaking transient state into config snapshots.
+#         """
+#         prefix = self.CONFIG_OVERRIDE_PREFIX
+#         for key, value in os.environ.items():
+#             if key.startswith(prefix):
+#                 config_key = key[len(prefix):].lower().replace("_", ".")
+#                 self._set_nested(config_key, value)
+
+# Alternative: keep AO_ prefix but add an explicit ALLOWLIST:
+#
+#     CONFIG_OVERRIDE_ALLOWLIST = {
+#         "AO_LOG_LEVEL", "AO_MAX_RETRIES", "AO_TIMEOUT",
+#         "AO_REGISTRY_URL", "AO_DB_PATH", "AO_SANDBOX_LIMITS",
+#     }
+#
+#     def _load_env_overrides(self) -> None:
+#         for key in self.CONFIG_OVERRIDE_ALLOWLIST:
+#             if key in os.environ:
+#                 config_key = key[3:].lower().replace("_", ".")
+#                 self._set_nested(config_key, os.environ[key])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Additional tests for patches 3 & 4
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_runtime_zero_exit_is_stopped():
+    """Test: agent with exit code 0 should be STOPPED, not CRASHED."""
+    from src.agent.runtime import AgentRuntime, RuntimeState
+
+    rt = AgentRuntime()
+    # Start a process that exits successfully
+    rt.start("test_ok", ["python", "-c", "exit(0)"])
+    # Wait for it to finish
+    import time
+    for _ in range(20):
+        if rt._processes.get("test_ok") and rt._processes["test_ok"].poll() is not None:
+            break
+        time.sleep(0.1)
+
+    state = rt.get_state("test_ok")
+    assert state == RuntimeState.STOPPED, f"Expected STOPPED, got {state}"
+
+
+def test_runtime_nonzero_exit_is_crashed():
+    """Test: agent with non-zero exit code should be CRASHED."""
+    from src.agent.runtime import AgentRuntime, RuntimeState
+
+    rt = AgentRuntime()
+    rt.start("test_fail", ["python", "-c", "exit(1)"])
+    import time
+    for _ in range(20):
+        if rt._processes.get("test_fail") and rt._processes["test_fail"].poll() is not None:
+            break
+        time.sleep(0.1)
+
+    state = rt.get_state("test_fail")
+    assert state == RuntimeState.CRASHED, f"Expected CRASHED, got {state}"
+
+
+def test_config_does_not_leak_runtime_vars(monkeypatch):
+    """Test: AO_CONFIG_ vars are imported; bare AO_ vars are NOT."""
+    from src.common.config import Config
+    import json
+    import tempfile
+    import os
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump({"existing": "value"}, f)
+        path = f.name
+
+    # Set env overrides
+    monkeypatch.setenv("AO_CONFIG_LOG_LEVEL", "debug")
+    monkeypatch.setenv("AO_CONFIG_MAX_RETRIES", "5")
+    monkeypatch.setenv("AO_AGENT_ID", "runtime-agent-123")  # should NOT be imported
+
+    cfg = Config(path)
+    assert cfg.get("log.level") == "debug"
+    assert cfg.get("max.retries") == "5"
+    # Runtime-only AO_AGENT_ID must not leak into config
+    assert cfg.get("agent.id") is None
+    # Original config still accessible
+    assert cfg.get("existing") == "value"
+
+    os.unlink(path)
+
+
 if __name__ == "__main__":
     print("Run: pytest test_orchestration.py -v")

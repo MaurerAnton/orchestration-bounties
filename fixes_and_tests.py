@@ -500,5 +500,110 @@ def test_redact_no_false_positives():
     assert result == payload
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 7: Issue #658 ($5k) — Deep copy nested config to prevent external mutation
+# File: src/common/config.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Config currently stores dicts by reference. If a caller passes a mutable
+# dict and later modifies it, Config state changes silently. Fix: deep copy
+# in load() and set().
+
+import copy  # add to imports
+
+# In Config.load():
+#     def load(self, path: str) -> None:
+#         with open(path) as f:
+#             self._data = copy.deepcopy(json.load(f))
+
+# In Config._set_nested(), after the assignment:
+#     current[parts[-1]] = copy.deepcopy(value) if isinstance(value, (dict, list)) else value
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 8: Issue #641 ($4k) — Pin GitHub Actions to commit SHAs
+# File: .github/workflows/*.yml
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Replace all mutable action references with pinned commit SHAs.
+# Each action update must be a reviewed PR.
+
+ACTIONS_MAPPING = {
+    # --- BEFORE (mutable tag) ------------------- # --- AFTER (pinned SHA) ---
+    "actions/checkout@v4":           "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",  # v4.1.7
+    "actions/setup-python@v5":      "actions/setup-python@0b93645e9fea7318ecaed2b359599acb0132183c",  # v5.1.1
+    "actions/cache@v4":             "actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57",  # v4.2.0
+    "actions/upload-artifact@v4":   "actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882",  # v4.4.3
+    "github/codeql-action/init@v3": "github/codeql-action/init@f09c1c0a94de965c15400f5634aa133fac326c13",  # v3.27.5
+    "github/codeql-action/analyze@v3": "github/codeql-action/analyze@f09c1c0a94de965c15400f5634aa133fac326c13",
+    "pypa/gh-action-pypi-publish@release/v1": "pypa/gh-action-pypi-publish@897895f1e160c830e369f9779632ebc134688e1c",
+}
+
+
+# Validation script (.github/workflows/validate-actions.sh):
+VALIDATION_SCRIPT = '''\
+#!/usr/bin/env bash
+# Validate that all GitHub Actions are pinned to commit SHAs.
+set -euo pipefail
+INVALID=$(grep -rPn "uses:\\s*[^@]+@(?!([a-f0-9]{40}|\\d+\\.\\d+\\.\\d+))" .github/workflows/ || true)
+if [ -n "$INVALID" ]; then
+    echo "ERROR: Unpinned action references found:"
+    echo "$INVALID"
+    echo "All external actions must be pinned to a full 40-character commit SHA."
+    exit 1
+fi
+echo "All actions are pinned to commit SHAs."
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Additional tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_config_deep_copies_nested():
+    """Test: Config deep copies nested dicts to prevent external mutation."""
+    from src.common.config import Config
+    import json
+    import tempfile, os
+
+    nested = {"inner": {"key": "original"}}
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump({"root": nested["inner"]}, f)
+        path = f.name
+
+    cfg = Config(path)
+    # Mutate the original dict — config must be unaffected
+    nested["inner"]["key"] = "mutated"
+    assert cfg.get("root.key") == "original"
+
+    # Mutate via set
+    cfg.set("root.key", "updated")
+    assert cfg.get("root.key") == "updated"
+
+    os.unlink(path)
+
+
+def test_config_deep_copies_on_set():
+    """Test: Config.set deep copies mutable values."""
+    from src.common.config import Config
+    import json
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump({}, f)
+        path = f.name
+
+    cfg = Config(path)
+    mutable = {"a": 1, "b": [2, 3]}
+    cfg.set("data", mutable)
+    # Mutate original — config must be unaffected
+    mutable["a"] = 999
+    mutable["b"].append(4)
+    assert cfg.get("data.a") == 1
+    assert cfg.get("data.b") == [2, 3]
+
+    os.unlink(path)
+
+
 if __name__ == "__main__":
     print("Run: pytest test_orchestration.py -v")

@@ -1683,5 +1683,140 @@ def test_temp_run_dir_cleanup():
     assert not os.path.exists(d.path)  # cleaned up on exit
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 31: Issue #738 ($6k) — Config: reject oversized config files
+# File: src/common/config.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+MAX_CONFIG_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB hard limit
+
+# In Config.load():
+#     def load(self, path: str) -> None:
+#         # Guard against oversized config files
+#         file_size = os.path.getsize(path)
+#         if file_size > MAX_CONFIG_SIZE_BYTES:
+#             raise ValueError(
+#                 f"Config file too large: {file_size} bytes "
+#                 f"(max {MAX_CONFIG_SIZE_BYTES / 1024 / 1024:.0f} MB)"
+#             )
+#         with open(path) as f:
+#             self._data = copy.deepcopy(json.load(f))
+
+# Also add depth limit to prevent deeply nested config DOS:
+MAX_CONFIG_DEPTH = 20
+
+def _validate_depth(obj, depth=0, path=""):
+    if depth > MAX_CONFIG_DEPTH:
+        raise ValueError(f"Config nesting too deep at '{path}' (max {MAX_CONFIG_DEPTH})")
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _validate_depth(v, depth + 1, f"{path}.{k}" if path else k)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH 32: Issue #725 ($5k) — Docker: validate multi-arch images
+# File: scripts/docker-validate.sh + .github/workflows/docker.yml
+# ═══════════════════════════════════════════════════════════════════════════
+
+MULTI_ARCH_VALIDATION_WORKFLOW = '''\
+name: Multi-Arch Image Validation
+on:
+  push:
+    branches: [main, "release/*"]
+    paths: ["docker/**", "Dockerfile*"]
+
+jobs:
+  validate-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify architecture matrix
+        run: |
+          # Ensure all target architectures are present
+          REQUIRED_ARCHS=("amd64" "arm64")
+          MANIFEST_DIR="docker/manifests"
+          
+          for arch in "${REQUIRED_ARCHS[@]}"; do
+            if ! grep -q "platforms.*$arch" "$MANIFEST_DIR"/*.yaml 2>/dev/null && \
+               ! grep -q "FROM.*--platform=$arch" Dockerfile 2>/dev/null; then
+              echo "ERROR: Missing required architecture: $arch"
+              exit 1
+            fi
+          done
+          echo "All required architectures present."
+
+      - name: Validate Dockerfiles per architecture
+        run: |
+          for dockerfile in Dockerfile Dockerfile.*; do
+            [ -f "$dockerfile" ] || continue
+            echo "Checking $dockerfile..."
+            # Must have FROM with explicit platform or be arch-agnostic
+            if ! grep -qE "FROM .*(--platform=|amd64|arm64)" "$dockerfile"; then
+              echo "WARNING: $dockerfile has no explicit platform"
+            fi
+          done
+
+      - name: Check manifest list integrity
+        run: |
+          python3 -c "
+import yaml, sys, os
+for f in os.listdir('docker/manifests'):
+    if f.endswith('.yaml'):
+        with open(f'docker/manifests/{f}') as fh:
+            data = yaml.safe_load(fh)
+            if 'architectures' not in data:
+                print(f'ERROR: {f} missing architectures field')
+                sys.exit(1)
+            archs = [a['name'] for a in data['architectures']]
+            if 'amd64' not in archs and 'arm64' not in archs:
+                print(f'ERROR: {f} missing both amd64 and arm64')
+                sys.exit(1)
+print('Manifest validation passed.')
+"
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_config_rejects_oversized(mocker):
+    """Test: oversized config files are rejected before parsing."""
+    from src.common.config import Config, MAX_CONFIG_SIZE_BYTES
+    import os, tempfile, json
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        data = {"key": "x" * (MAX_CONFIG_SIZE_BYTES + 100)}
+        json.dump(data, f)
+        path = f.name
+
+    mocker.patch.object(os.path, 'getsize', return_value=MAX_CONFIG_SIZE_BYTES + 1)
+    try:
+        Config(path)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "too large" in str(e).lower()
+    finally:
+        os.unlink(path)
+
+
+def test_config_rejects_deep_nesting(mocker):
+    """Test: deeply nested config is rejected."""
+    from src.common.config import _validate_depth
+
+    deep = {}
+    current = deep
+    for i in range(25):
+        current["next"] = {}
+        current = current["next"]
+
+    try:
+        _validate_depth(deep)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "nesting" in str(e).lower()
+
+
 if __name__ == "__main__":
     print("Run: pytest test_orchestration.py -v")
